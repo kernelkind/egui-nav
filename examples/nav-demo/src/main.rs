@@ -1,7 +1,9 @@
 use eframe::egui;
 use egui::Frame;
 use egui_demo_lib::{easy_mark::EasyMarkEditor, ColorTest};
-use egui_nav::{Nav, NavAction};
+use egui_nav::{
+    DefaultNavTitle, DefaultTitleResponse, Nav, NavAction, NavUiType, PopupSheet, RouteResponse,
+};
 use std::fmt;
 
 fn test_routes() -> Vec<Route> {
@@ -19,11 +21,12 @@ fn main() -> Result<(), eframe::Error> {
         "Nav Demo",
         options,
         Box::new(|_cc| {
-            Box::new(MyApp {
+            Ok(Box::new(MyApp {
                 navigating: false,
                 returning: false,
                 routes: test_routes(),
-            })
+                popup: None,
+            }))
         }),
     )
 }
@@ -55,6 +58,7 @@ fn main() {
 #[derive(Default)]
 struct MyApp {
     routes: Vec<Route>,
+    popup: Option<Route>,
     navigating: bool,
     returning: bool,
 }
@@ -76,69 +80,155 @@ impl fmt::Display for Route {
 
 enum OurNavAction {
     Navigating(Route),
+    Popup(Route),
     Returning,
 }
 
 fn nav_ui(ui: &mut egui::Ui, app: &mut MyApp) {
     ui.visuals_mut().interact_cursor = Some(egui::CursorIcon::PointingHand);
 
-    let response = Nav::new(app.routes.clone())
+    if let Some(popup) = app.popup {
+        if let Some(bg_route) = app.routes.last() {
+            let resp = PopupSheet::new(bg_route, &popup)
+                .navigating(app.navigating)
+                .returning(app.returning)
+                .show(ui, |ui, typ, bg_route| match typ {
+                    NavUiType::Title => {
+                        DefaultNavTitle::default()
+                            .ui(ui, &[&bg_route])
+                            .map(|n| match n {
+                                DefaultTitleResponse::Back => OurNavAction::Returning,
+                            })
+                    }
+
+                    NavUiType::Body => match *bg_route {
+                        Route::Editor => {
+                            ui.vertical(|ui| {
+                                let mut action: Option<OurNavAction> = None;
+
+                                if ui.button("Color Test").clicked() {
+                                    action = Some(OurNavAction::Navigating(Route::ColorTest));
+                                }
+
+                                if ui.button("Popup color test").clicked() {
+                                    action = Some(OurNavAction::Popup(Route::ColorTest));
+                                }
+
+                                let _ = ui.button("Back");
+
+                                EasyMarkEditor::default().ui(ui);
+                                action
+                            })
+                            .inner
+                        }
+
+                        Route::ColorTest => {
+                            ui.vertical(|ui| {
+                                let mut action: Option<OurNavAction> = None;
+                                if ui.button("Editor").clicked() {
+                                    action = Some(OurNavAction::Navigating(Route::Editor));
+                                }
+                                let _ = ui.button("Back");
+                                ColorTest::default().ui(ui);
+                                action
+                            })
+                            .inner
+                        }
+                    },
+                });
+
+            if let Some(NavAction::Returned(_)) = resp.action {
+                app.popup = None;
+                app.returning = false;
+            } else if let Some(NavAction::Navigated) = resp.action {
+                app.navigating = false;
+            }
+
+            return;
+        }
+    }
+
+    let response = Nav::new(&app.routes)
         .navigating(app.navigating)
         .returning(app.returning)
-        .show(ui, |ui, nav| match nav.top() {
-            Route::Editor => {
-                ui.vertical(|ui| {
-                    let mut action: Option<OurNavAction> = None;
+        .show(ui, |ui, typ, nav| match typ {
+            NavUiType::Title => {
+                let r = DefaultNavTitle::default()
+                    .ui(ui, nav.routes())
+                    .map(|n| match n {
+                        DefaultTitleResponse::Back => OurNavAction::Returning,
+                    });
 
-                    if ui.button("Color Test").clicked() {
-                        action = Some(OurNavAction::Navigating(Route::ColorTest));
-                    }
-
-                    if nav.routes().len() > 1 {
-                        if ui.button("Back").clicked() {
-                            action = Some(OurNavAction::Returning);
-                        }
-                    }
-
-                    EasyMarkEditor::default().ui(ui);
-                    action
-                })
-                .inner
+                RouteResponse {
+                    response: r,
+                    can_take_drag_from: Vec::new(),
+                }
             }
 
-            Route::ColorTest => {
-                ui.vertical(|ui| {
-                    let mut action: Option<OurNavAction> = None;
-                    if ui.button("Editor").clicked() {
-                        action = Some(OurNavAction::Navigating(Route::Editor));
-                    }
-                    if nav.routes().len() > 1 {
-                        if ui.button("Back").clicked() {
+            NavUiType::Body => match nav.top() {
+                Route::Editor => {
+                    ui.vertical(|ui| {
+                        let mut action: Option<OurNavAction> = None;
+
+                        if ui.button("Color Test").clicked() {
+                            action = Some(OurNavAction::Navigating(Route::ColorTest));
+                        }
+
+                        if ui.button("Popup color test").clicked() {
+                            action = Some(OurNavAction::Popup(Route::ColorTest));
+                        }
+
+                        if nav.routes().len() > 1 && ui.button("Back").clicked() {
                             action = Some(OurNavAction::Returning);
                         }
-                    }
-                    ColorTest::default().ui(ui);
-                    action
-                })
-                .inner
-            }
+
+                        EasyMarkEditor::default().ui(ui);
+                        RouteResponse {
+                            response: action,
+                            can_take_drag_from: Vec::new(),
+                        }
+                    })
+                    .inner
+                }
+
+                Route::ColorTest => {
+                    ui.vertical(|ui| {
+                        let mut action: Option<OurNavAction> = None;
+                        if ui.button("Editor").clicked() {
+                            action = Some(OurNavAction::Navigating(Route::Editor));
+                        }
+                        if nav.routes().len() > 1 && ui.button("Back").clicked() {
+                            action = Some(OurNavAction::Returning);
+                        }
+                        ColorTest::default().ui(ui);
+                        RouteResponse {
+                            response: action,
+                            can_take_drag_from: Vec::new(),
+                        }
+                    })
+                    .inner
+                }
+            },
         });
 
-    if let Some(action) = response.inner {
+    if let Some(action) = response.response.or(response.title_response) {
         match action {
             OurNavAction::Navigating(route) => {
                 app.navigating = true;
                 app.routes.push(route);
             }
-
             OurNavAction::Returning => {
                 app.returning = true;
+            }
+            OurNavAction::Popup(route) => {
+                app.popup = Some(route);
+                app.navigating = true;
             }
         }
     }
 
     if let Some(action) = response.action {
-        if let NavAction::Returned = action {
+        if let NavAction::Returned(_) = action {
             app.routes.pop();
             app.returning = false;
             println!("Popped route {:?}", app.routes);
@@ -151,7 +241,7 @@ fn nav_ui(ui: &mut egui::Ui, app: &mut MyApp) {
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default()
-            .frame(Frame::none().outer_margin(egui::Margin::same(50.0)))
+            .frame(Frame::new().outer_margin(egui::Margin::same(50)))
             .show(ctx, |ui| {
                 let cells = 2;
                 let width = ui.available_rect_before_wrap().width() / (cells as f32);

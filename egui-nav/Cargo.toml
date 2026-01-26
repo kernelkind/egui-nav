@@ -1,11 +1,16 @@
 [package]
 name = "egui_nav"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+description = "A navigation control for egui"
+readme = "../README.md"
+license = "MIT"
 
 [dependencies]
 #egui = { path = "/home/jb55/dev/github/emilk/egui/crates/egui" }
 #egui_extras = { path = "/home/jb55/dev/github/emilk/egui/crates/egui_extras" }
-egui = "*"
-egui_extras = "*"
+egui = { workspace = true }
+egui_extras =  { workspace = true }
+bitflags = "2.5.0"
+tracing = { version = "0.1.40" }
  

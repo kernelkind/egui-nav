@@ -1,21 +1,39 @@
-use core::fmt::Display;
-use egui::{emath::TSTransform, vec2, LayerId, Order, Pos2, Rect, Sense, Stroke, Vec2};
+use drag::Drag;
+use egui::{emath::TSTransform, vec2, LayerId, Order, Rect, Vec2};
 
-pub struct Nav<T: Clone> {
-    /// The back chevron stroke
-    padding: f32,
-    stroke: Option<Stroke>,
-    chevron_size: Vec2,
-    route: Vec<T>,
+mod default_ui;
+mod drag;
+mod drawer;
+mod popup_sheet;
+mod ui;
+mod util;
+
+pub use default_ui::{DefaultNavTitle, DefaultTitleResponse};
+pub use drag::DragDirection;
+pub use drawer::{DrawerResponse, NavDrawer};
+pub use popup_sheet::{Percent, PopupResponse, PopupSheet, Split};
+pub use ui::NavUiType;
+
+use crate::drag::{drag_delta, DragAngle};
+
+pub struct Nav<'a, Route: Clone> {
+    id_source: Option<egui::Id>,
+    route: &'a [Route],
     navigating: bool,
-    show_title: bool,
     returning: bool,
+    animate_transitions: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReturnType {
+    Drag,
+    Click,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NavAction {
     /// We're returning to the previous view
-    Returning,
+    Returning(ReturnType),
 
     /// We released the drag, but not far enough to actually return
     Resetting,
@@ -24,7 +42,7 @@ pub enum NavAction {
     Dragging,
 
     /// We've returning to the previous view. Pop your route!
-    Returned,
+    Returned(ReturnType),
 
     /// We've navigating to the next view.
     Navigating,
@@ -36,12 +54,101 @@ pub enum NavAction {
 impl NavAction {
     fn is_transitioning(&self) -> bool {
         match self {
-            NavAction::Returning => true,
+            NavAction::Returning(_) => true,
             NavAction::Resetting => true,
             NavAction::Dragging => true,
-            NavAction::Returned => false,
+            NavAction::Returned(_) => false,
             NavAction::Navigated => false,
             NavAction::Navigating => true,
+        }
+    }
+
+    fn handle(
+        self,
+        ui: &mut egui::Ui,
+        state: &mut State,
+        drag_direction: DragDirection,
+        navigated_offset: f32,
+        returned_offset: f32,
+        animate: bool,
+    ) {
+        match self {
+            NavAction::Dragging => {
+                state.offset += drag_delta(ui, drag_direction);
+                if navigated_offset < returned_offset {
+                    if state.offset < navigated_offset {
+                        // we are outside the navigated boundary
+                        state.offset = navigated_offset;
+                    }
+
+                    if state.offset > returned_offset {
+                        // we are outside the returned boundary
+                        state.offset = returned_offset;
+                    }
+                    return;
+                }
+
+                if navigated_offset > returned_offset {
+                    if state.offset > navigated_offset {
+                        // we are outside the navigated boundary
+                        state.offset = navigated_offset;
+                    }
+                    if state.offset < returned_offset {
+                        // we are outside the returned boundary
+                        state.offset = returned_offset;
+                    }
+                }
+            }
+            NavAction::Returned(_) => {
+                state.action = None;
+            }
+            NavAction::Navigated => {
+                state.action = None;
+            }
+            NavAction::Navigating => {
+                if !animate {
+                    state.offset = navigated_offset;
+                    state.action = Some(NavAction::Navigated);
+                    return;
+                }
+                let left = state.offset > navigated_offset;
+                if let Some(offset) = spring_animate(state.offset, navigated_offset, left) {
+                    ui.ctx().request_repaint();
+                    state.offset = offset;
+                } else {
+                    state.action = Some(NavAction::Navigated);
+                }
+            }
+            NavAction::Returning(return_type) => {
+                if !animate {
+                    state.offset = returned_offset;
+                    state.action = Some(NavAction::Returned(return_type));
+                    return;
+                }
+                // We're returning, move the current view off to the
+                // returned_offset until the entire view is gone.
+
+                let left = state.offset > returned_offset;
+                if let Some(offset) = spring_animate(state.offset, returned_offset, left) {
+                    ui.ctx().request_repaint();
+                    state.offset = offset;
+                } else {
+                    state.offset = returned_offset;
+                    state.action = Some(NavAction::Returned(return_type));
+                }
+            }
+            NavAction::Resetting => {
+                // If we're resetting, animate the current offset
+                // back to the current view
+
+                let left = state.offset > navigated_offset;
+                if let Some(offset) = spring_animate(state.offset, navigated_offset, left) {
+                    ui.ctx().request_repaint();
+                    state.offset = offset;
+                } else {
+                    state.action = None
+                }
+            }
         }
     }
 }
@@ -55,7 +162,7 @@ struct State {
 
 impl State {
     fn is_transitioning(&self) -> bool {
-        self.action.map_or(false, |s| s.is_transitioning())
+        self.action.is_some_and(|s| s.is_transitioning())
     }
 }
 
@@ -70,47 +177,33 @@ impl State {
 }
 
 pub struct NavResponse<R> {
-    pub inner: R,
+    pub response: R,
+    pub title_response: R,
     pub action: Option<NavAction>,
+    pub can_take_drag_from: Vec<egui::Id>,
 }
 
-impl<T: Clone> Nav<T> {
-    /// Nav requires at least one route or it will panic
-    pub fn new(route: Vec<T>) -> Self {
+impl<'a, Route: Clone> Nav<'a, Route> {
+    pub fn new(route: &'a [Route]) -> Self {
         // precondition: we must have at least one route. this simplifies
         // the rest of the control, and it's easy to catchbb
-        assert!(route.len() > 0, "Nav routes cannot be empty");
-        let chevron_size = Vec2::new(14.0, 20.0);
-        //let stroke = Stroke::new(2.0, Color32::GOLD);
-        let stroke: Option<Stroke> = None;
-        let padding = 4.0;
+        assert!(!route.is_empty(), "Nav routes cannot be empty");
         let navigating = false;
-        let show_title = true;
         let returning = false;
+        let id_source = None;
+        let animate_transitions = true;
 
         Nav {
-            show_title,
+            id_source,
             navigating,
             returning,
-            padding,
-            stroke,
-            chevron_size,
             route,
+            animate_transitions,
         }
     }
 
-    pub fn title(mut self, show: bool) -> Self {
-        self.show_title = show;
-        self
-    }
-
-    pub fn chevron_padding(mut self, padding: f32) -> Self {
-        self.padding = padding;
-        self
-    }
-
-    pub fn stroke(mut self, stroke: impl Into<Stroke>) -> Self {
-        self.stroke = Some(stroke.into());
+    pub fn id_source(mut self, id: egui::Id) -> Self {
+        self.id_source = Some(id);
         self
     }
 
@@ -128,17 +221,33 @@ impl<T: Clone> Nav<T> {
         self
     }
 
-    pub fn chevron_size(mut self, size: Vec2) -> Self {
-        self.chevron_size = size;
+    pub fn animate_transitions(mut self, animate: bool) -> Self {
+        self.animate_transitions = animate;
         self
     }
 
-    pub fn routes(&self) -> &Vec<T> {
-        &self.route
+    /// Returns the ID used for state storage.
+    ///
+    /// When `id_source` is provided, returns a stable ID independent of the UI
+    /// context. This ensures consistent state storage when content is rendered
+    /// in different contexts (e.g., inside `render_bg` vs directly).
+    fn id(&self, ui: &egui::Ui) -> egui::Id {
+        match self.id_source {
+            Some(id_source) => egui::Id::new("nav").with(id_source),
+            None => ui.id().with("nav"),
+        }
+    }
+
+    pub fn drag_id(&self, ui: &egui::Ui) -> egui::Id {
+        self.id(ui).with("drag")
+    }
+
+    pub fn routes(&self) -> &[Route] {
+        self.route
     }
 
     /// Nav guarantees there is at least one route element
-    pub fn top(&self) -> &T {
+    pub fn top(&self) -> &Route {
         &self.route[self.route.len() - 1]
     }
 
@@ -151,118 +260,35 @@ impl<T: Clone> Nav<T> {
     ///   - routes.top_n(0) for the top route, Route::Profile
     ///   - routes.top_n(1) for the route immediate before the top route, Route::Home
     ///
-    pub fn top_n(&self, n: usize) -> Option<&T> {
-        let ind = self.route.len() as i32 - (n as i32) - 1;
-        if ind < 0 {
-            None
-        } else {
-            self.route.get(ind as usize)
-        }
-    }
-
-    /// Safer version of new if we're not sure if we will have non-empty routes
-    pub fn try_new(route: Vec<T>) -> Option<Self> {
-        if route.len() == 0 {
-            None
-        } else {
-            Some(Nav::new(route))
-        }
-    }
-
-    fn header(
-        &self,
-        ui: &mut egui::Ui,
-        label: String,
-        back: Option<String>,
-    ) -> Option<egui::Response> {
-        let mut header_rect = ui.available_rect_before_wrap();
-        header_rect.set_height(self.chevron_size.y + 4.0);
-
-        let response = if let Some(back) = back {
-            Some(ui.put(header_rect, |ui: &mut egui::Ui| {
-                ui.horizontal_centered(|ui| {
-                    let stroke = self
-                        .stroke
-                        .unwrap_or_else(|| Stroke::new(2.0, ui.visuals().hyperlink_color));
-
-                    let chev_response = chevron(ui, self.padding, self.chevron_size, stroke);
-
-                    let label_response = ui.add(
-                        egui::Label::new(back)
-                            .sense(Sense::click())
-                            .selectable(false),
-                    );
-
-                    let response = chev_response.union(label_response);
-
-                    if let Some(cursor) = ui.visuals().interact_cursor {
-                        if response.hovered() {
-                            ui.ctx().set_cursor_icon(cursor);
-                        }
-                    }
-
-                    response
-                })
-                .inner
-            }))
-        } else {
-            None
-        };
-
-        if self.show_title {
-            ui.put(header_rect, |ui: &mut egui::Ui| {
-                ui.vertical_centered_justified(|ui| {
-                    ui.add(egui::Label::new(label).selectable(false))
-                })
-                .inner
-            });
-        }
-
-        ui.advance_cursor_after_rect(header_rect);
-
-        response
+    pub fn top_n(&self, n: usize) -> Option<&Route> {
+        util::arr_top_n(self.route, n)
     }
 
     pub fn show<F, R>(&self, ui: &mut egui::Ui, show_route: F) -> NavResponse<R>
     where
-        F: Fn(&mut egui::Ui, &Nav<T>) -> R,
-        T: Display + Clone,
+        F: Fn(&mut egui::Ui, NavUiType, &Nav<Route>) -> RouteResponse<R>,
     {
-        let id = ui.id().with("nav");
+        let mut show_route = show_route;
+        self.show_internal(ui, &mut show_route)
+    }
+
+    pub fn show_mut<F, R>(&self, ui: &mut egui::Ui, mut show_route: F) -> NavResponse<R>
+    where
+        F: FnMut(&mut egui::Ui, NavUiType, &Nav<Route>) -> RouteResponse<R>,
+    {
+        self.show_internal(ui, &mut show_route)
+    }
+
+    fn show_internal<F, R>(&self, ui: &mut egui::Ui, show_route: &mut F) -> NavResponse<R>
+    where
+        F: FnMut(&mut egui::Ui, NavUiType, &Nav<Route>) -> RouteResponse<R>,
+    {
+        let id = self.id(ui);
         let mut state = State::load(ui.ctx(), id).unwrap_or_default();
 
-        // We only handle dragging when there is more than 1 route
-        if self.route.len() > 1 {
-            // Drag contents to transition back.
-            // We must do this BEFORE adding content to the `Nav`,
-            // or we will steal input from the widgets we contain.
-            let available_rect = ui.available_rect_before_wrap();
-            let content_response = ui.interact(available_rect, id.with("drag"), Sense::drag());
-            if content_response.dragged() {
-                state.action = Some(NavAction::Dragging)
-            } else if content_response.drag_stopped() {
-                // we've stopped dragging, check to see if the offset is
-                // passed a certain point, to determine if we should return
-                // or animate back
+        let drag_rect = ui.available_rect_before_wrap();
 
-                if state.offset > available_rect.width() / 2.0 {
-                    state.action = Some(NavAction::Returning)
-                } else {
-                    state.action = Some(NavAction::Resetting)
-                }
-            }
-        }
-
-        if let Some(resp) = self.header(
-            ui,
-            self.top().to_string(),
-            self.top_n(1).map(|r| r.to_string()),
-        ) {
-            if resp.clicked() {
-                state.action = Some(NavAction::Returning);
-            }
-        }
-
+        let title_response = show_route(ui, NavUiType::Title, self).response;
         let available_rect = ui.available_rect_before_wrap();
 
         // This should probably override other actions?
@@ -271,132 +297,52 @@ impl<T: Clone> Nav<T> {
                 state.offset = available_rect.width();
                 state.action = Some(NavAction::Navigating);
             }
-        } else if self.returning {
-            if state.action != Some(NavAction::Returning) {
-                state.action = Some(NavAction::Returning);
-            }
+        } else if self.returning && !matches!(state.action, Some(NavAction::Returning(_))) {
+            state.action = Some(NavAction::Returning(ReturnType::Click));
         }
-
-        if let Some(action) = state.action {
-            match action {
-                NavAction::Dragging => {
-                    state.offset += ui.input(|input| input.pointer.delta()).x;
-                    if state.offset < 0.0 {
-                        state.offset = 0.0;
-                    }
-                }
-                NavAction::Returned => {
-                    state.action = None;
-                }
-                NavAction::Navigated => {
-                    state.action = None;
-                }
-                NavAction::Navigating => {
-                    if let Some(offset) = spring_animate(state.offset, 0.0, true) {
-                        ui.ctx().request_repaint();
-                        state.offset = offset;
-                    } else {
-                        state.action = Some(NavAction::Navigated);
-                    }
-                }
-                NavAction::Returning => {
-                    // We're returning, move the current view off to the
-                    // right until the entire view is gone.
-
-                    if let Some(offset) =
-                        spring_animate(state.offset, available_rect.width(), false)
-                    {
-                        ui.ctx().request_repaint();
-                        state.offset = offset;
-                    } else {
-                        state.offset = 0.0;
-                        state.action = Some(NavAction::Returned);
-                    }
-                }
-                NavAction::Resetting => {
-                    // If we're resetting, animate the current offset
-                    // back to the current view
-
-                    if let Some(offset) = spring_animate(state.offset, 0.0, true) {
-                        ui.ctx().request_repaint();
-                        state.offset = offset;
-                    } else {
-                        state.action = None
-                    }
-                }
-            }
-        }
-
-        state.store(ui.ctx(), id);
 
         // transition rendering
         // behind transition layer
         let transitioning = state.is_transitioning();
         if transitioning {
-            let id = ui.id().with("behind");
-            let min_rect = state.popped_min_rect.unwrap_or(available_rect);
-            let initial_shift = -min_rect.width() * 0.1;
-            let mut amt = initial_shift + springy(state.offset);
-            if amt > 0.0 {
-                amt = 0.0;
-            }
+            let x_translate_amt = {
+                let min_rect = state.popped_min_rect.unwrap_or(available_rect);
+                let initial_shift = -min_rect.width() * 0.1;
+                let mut amt = initial_shift + springy(state.offset);
+                if amt > 0.0 {
+                    amt = 0.0;
+                }
 
-            //let clip_width = state.offset.max(available_rect.width());
+                amt
+            };
+
             let clip = Rect::from_min_size(
-                available_rect.min + egui::vec2(-amt, 0.0),
+                available_rect.min + egui::vec2(-x_translate_amt, 0.0),
                 vec2(state.offset, available_rect.max.y),
             );
 
-            let mut ui = egui::Ui::new(
-                ui.ctx().clone(),
-                //LayerId::new(Order::Background, id),
-                LayerId::new(Order::Background, id),
-                ui.id(),
-                available_rect,
-                clip,
-            );
-
-            // render the previous nav view in the background when
-            // transitioning
-            let nav = Nav {
-                route: self.route[..self.route.len() - 1].to_vec(),
+            let translate_vec = egui::vec2(x_translate_amt, 0.0);
+            let bg_nav = Nav {
+                route: &self.route[..self.route.len() - 1],
                 ..*self
             };
-            let _r = show_route(&mut ui, &nav);
-
-            state.popped_min_rect = Some(ui.min_rect());
 
             let strength = 50.0; // fade strength (max is 255)
             let alpha = ((1.0 - (state.offset / available_rect.width())) * strength) as u8;
-            let fade_color = egui::Color32::from_black_alpha(alpha);
+            let bg_resp = render_bg(
+                ui,
+                Some(translate_vec),
+                clip,
+                available_rect,
+                Some(alpha),
+                |ui| show_route(ui, NavUiType::Body, &bg_nav).can_take_drag_from,
+            );
 
-            ui.painter()
-                .rect_filled(clip, egui::Rounding::default(), fade_color);
-
-            if amt < 0.0 {
-                ui.ctx().transform_layer_shapes(
-                    ui.layer_id(),
-                    TSTransform::from_translation(Vec2::new(amt, 0.0)),
-                );
-            }
-        }
+            state.popped_min_rect = Some(bg_resp.rect);
+        };
 
         // foreground layer
-        {
-            let id = ui.id().with("front");
-
-            let layer_id = if transitioning {
-                // when transitioning, we need a new layer id otherwise the
-                // view transform will transform more things than we want
-                LayerId::new(Order::Foreground, id)
-            } else {
-                // if we don't use the same layer id as the ui, then we
-                // will have scrollview MouseWheel scroll issues due to
-                // the way rect_contains_pointer works with overlapping
-                // layers
-                ui.layer_id()
-            };
-
+        let fg_resp = {
             let clip = Rect::from_min_size(
                 available_rect.min,
                 vec2(
@@ -405,59 +351,103 @@ impl<T: Clone> Nav<T> {
                 ),
             );
 
-            let mut ui = egui::Ui::new(ui.ctx().clone(), layer_id, ui.id(), available_rect, clip);
-
-            let inner = if let Some(NavAction::Returned) = state.action {
-                // to avoid a flicker, render the popped route when we
-                // are in the returned state
-                let nav = Nav {
-                    route: self.route[..self.route.len() - 1].to_vec(),
-                    ..*self
-                };
-                show_route(&mut ui, &nav)
+            let layer_id = if transitioning {
+                // when transitioning, we need a new layer id otherwise the
+                // view transform will transform more things than we want
+                LayerId::new(Order::Foreground, ui.id().with("fg"))
             } else {
-                show_route(&mut ui, self)
+                // if we don't use the same layer id as the ui, then we
+                // will have scrollview MouseWheel scroll issues due to
+                // the way rect_contains_pointer works with overlapping
+                // layers
+                ui.layer_id()
             };
+            render_fg(
+                ui,
+                ui.id(), // this must be ui.id() to not break scroll positions
+                layer_id,
+                Some(Vec2::new(state.offset, 0.0)),
+                clip,
+                available_rect,
+                |ui| show_route(ui, NavUiType::Body, self),
+            )
+        };
 
-            if state.offset != 0.0 {
-                ui.ctx().transform_layer_shapes(
-                    ui.layer_id(),
-                    egui::emath::TSTransform::from_translation(Vec2::new(state.offset, 0.0)),
-                );
-            }
+        let ids_to_expose = if self.routes().len() > 1 {
+            Vec::new()
+        } else {
+            fg_resp.can_take_drag_from.clone()
+        };
 
-            NavResponse {
-                inner,
-                action: state.action,
+        // We only handle dragging when there is more than 1 route
+        if self.route.len() > 1 {
+            let content_rect = ui.available_rect_before_wrap();
+            let mut cur_drag = Drag::new(
+                self.drag_id(ui),
+                DragDirection::LeftToRight,
+                drag_rect,
+                state.offset,
+                content_rect.width() / 4.0,
+                DragAngle::Balanced,
+            );
+            if let Some(action) = cur_drag.handle(ui, fg_resp.can_take_drag_from) {
+                let nav_action = match action {
+                    crate::drag::DragAction::Dragging => NavAction::Dragging,
+                    crate::drag::DragAction::DragReleased { threshold_met } => {
+                        if threshold_met {
+                            NavAction::Returning(crate::ReturnType::Drag)
+                        } else {
+                            NavAction::Resetting
+                        }
+                    }
+                    crate::drag::DragAction::DragUnrelated => NavAction::Resetting,
+                };
+                state.action = Some(nav_action);
             }
+        }
+
+        if let Some(action) = state.action {
+            action.handle(
+                ui,
+                &mut state,
+                DragDirection::LeftToRight,
+                0.0,
+                available_rect.width(),
+                self.animate_transitions,
+            );
+        }
+        if matches!(
+            state.action,
+            Some(NavAction::Returned(_)) | Some(NavAction::Navigated)
+        ) {
+            state.offset = 0.0;
+        }
+
+        state.store(ui.ctx(), id);
+
+        NavResponse {
+            response: fg_resp.response,
+            title_response,
+            action: state.action,
+            can_take_drag_from: ids_to_expose,
         }
     }
 }
 
-fn chevron(ui: &mut egui::Ui, pad: f32, size: Vec2, stroke: impl Into<Stroke>) -> egui::Response {
-    let (r, painter) = ui.allocate_painter(size, Sense::click());
-
-    let min = r.rect.min;
-    let max = r.rect.max;
-
-    let apex = Pos2::new(min.x + pad, min.y + size.y / 2.0);
-    let top = Pos2::new(max.x - pad, min.y + pad);
-    let bottom = Pos2::new(max.x - pad, max.y - pad);
-
-    let stroke = stroke.into();
-    painter.line_segment([apex, top], stroke);
-    painter.line_segment([apex, bottom], stroke);
-
-    r
-}
-
 fn springy(offset: f32) -> f32 {
-    ((offset.abs().powf(1.2) - 1.0) * 0.1).max(0.5)
+    (offset.abs() * 0.3).max(0.2)
 }
 
 fn spring_animate(offset: f32, target: f32, left: bool) -> Option<f32> {
+    // nothing left to animate, user released drag beyond target
+    if (left && offset <= target) || (!left && offset >= target) {
+        return None;
+    }
+
     let abs_offset = (offset - target).abs();
-    if abs_offset > 0.0 {
+    if abs_offset > 0.1 {
+        // need some margin of error
+        // some margin of error is needed
         let sgn = (offset - target).signum();
         let amt = springy(abs_offset);
         let adj = amt * (if left { -1.0 } else { 1.0 });
@@ -473,4 +463,109 @@ fn spring_animate(offset: f32, target: f32, left: bool) -> Option<f32> {
         // we've reset, we're not in any specific state anymore
         None
     }
+}
+
+pub(crate) fn render_bg(
+    ui: &mut egui::Ui,
+    translate_vec: Option<egui::Vec2>, // whether to translate the rendered route
+    clip: egui::Rect,                  // rect that should be clipped
+    available_rect: egui::Rect,        // rect of viewing area
+    alpha: Option<u8>,
+    mut render_route: impl FnMut(&mut egui::Ui) -> Vec<egui::Id>,
+) -> RenderBgResponse {
+    // Use a unique ID for the background layer child UI to prevent widget ID
+    // collisions when the same content is rendered in both background and
+    // foreground layers (e.g., in NavDrawer scenarios).
+    let id = ui.id().with("bg");
+
+    let layer_id = LayerId::new(Order::Background, id);
+    let mut ui = egui::Ui::new(
+        ui.ctx().clone(),
+        id,
+        egui::UiBuilder::new()
+            .style(ui.style().clone())
+            .layer_id(layer_id)
+            .max_rect(available_rect),
+    );
+    ui.set_clip_rect(clip);
+
+    let can_take_drag_from = render_route(&mut ui);
+
+    let res = ui.min_rect();
+
+    if let Some(alpha) = alpha {
+        let fade_color = egui::Color32::from_black_alpha(alpha);
+
+        ui.painter()
+            .rect_filled(clip, egui::CornerRadius::default(), fade_color);
+    }
+
+    let Some(translate_vec) = translate_vec else {
+        return RenderBgResponse {
+            rect: res,
+            can_take_drag_from,
+        };
+    };
+
+    if translate_vec == Vec2::ZERO {
+        return RenderBgResponse {
+            rect: res,
+            can_take_drag_from,
+        };
+    }
+
+    ui.ctx()
+        .transform_layer_shapes(ui.layer_id(), TSTransform::from_translation(translate_vec));
+
+    RenderBgResponse {
+        rect: res,
+        can_take_drag_from,
+    }
+}
+
+struct RenderBgResponse {
+    rect: egui::Rect,
+    can_take_drag_from: Vec<egui::Id>,
+}
+
+pub(crate) fn render_fg<R>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    layer_id: LayerId,
+    translate_vec: Option<egui::Vec2>, // whether to translate the rendered route
+    clip: egui::Rect,
+    available_rect: egui::Rect,
+    mut render_route: impl FnMut(&mut egui::Ui) -> RouteResponse<R>,
+) -> RouteResponse<R> {
+    let mut ui = egui::Ui::new(
+        ui.ctx().clone(),
+        id,
+        egui::UiBuilder::new()
+            .style(ui.style().clone())
+            .layer_id(layer_id)
+            .max_rect(available_rect),
+    );
+    ui.set_clip_rect(clip);
+
+    let res = render_route(&mut ui);
+
+    let Some(translate_vec) = translate_vec else {
+        return res;
+    };
+
+    if translate_vec == Vec2::ZERO {
+        return res;
+    }
+
+    ui.ctx().transform_layer_shapes(
+        ui.layer_id(),
+        egui::emath::TSTransform::from_translation(translate_vec),
+    );
+
+    res
+}
+
+pub struct RouteResponse<R> {
+    pub response: R,
+    pub can_take_drag_from: Vec<egui::Id>,
 }
