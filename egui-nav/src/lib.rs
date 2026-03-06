@@ -466,11 +466,12 @@ pub(crate) fn render_bg(
     mut render_route: impl FnMut(&mut egui::Ui) -> Vec<egui::Id>,
 ) -> RenderBgResponse {
     let id = ui.id();
+    let bg_id = id.with("__nav_bg");
 
     let layer_id = LayerId::new(Order::Background, id);
     let mut ui = egui::Ui::new(
         ui.ctx().clone(),
-        id,
+        bg_id,
         egui::UiBuilder::new()
             .style(ui.style().clone())
             .layer_id(layer_id)
